@@ -36,16 +36,20 @@ async def _client() -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url=API)
 
 
-async def create_barrier(client: AsyncClient, participants, threshold=None, ttl_s=5):
+async def create_barrier(
+    client, participants, threshold=None, ttl_s=5, groups=None, quotas=None
+):
     deadline = (datetime.now(timezone.utc) + timedelta(seconds=ttl_s)).isoformat()
-    r = await client.post(
-        "/barriers",
-        json={
-            "participants": participants,
-            "threshold": threshold,
-            "deadline": deadline,
-        },
-    )
+    body = {
+        "participants": participants,
+        "threshold": threshold,
+        "deadline": deadline,
+    }
+    if groups is not None:
+        body["participant_groups"] = groups
+    if quotas is not None:
+        body["group_thresholds"] = quotas
+    r = await client.post("/barriers", json=body)
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -554,17 +558,19 @@ async def test_cancel_and_trigger_checkin_race_exactly_one_terminal_state():
                 f"barrier:{bid}:frozen",
                 f"barrier:{bid}:events",
                 f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
             ]
             now = f"{time.time():.3f}"
             # 两个脚本放入同一个事务：EXEC 时 Redis 按入队顺序串行执行，
             # 交替顺序即可稳定覆盖“先达标”与“先取消”两个方向。
             pipe = r.pipeline(transaction=True)
             if i % 2 == 0:
-                pipe.eval(CHECKIN_SCRIPT, 6, *keys, "a", now)
-                pipe.eval(CANCEL_SCRIPT, 6, *keys, "race", now)
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
             else:
-                pipe.eval(CANCEL_SCRIPT, 6, *keys, "race", now)
-                pipe.eval(CHECKIN_SCRIPT, 6, *keys, "a", now)
+                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
             first, second = await pipe.execute()
 
             g = await c.get(f"/barriers/{bid}")
@@ -591,3 +597,312 @@ async def test_cancel_and_trigger_checkin_race_exactly_one_terminal_state():
             winners.append(status)
 
         assert set(winners) == {"reached", "cancelled"}, Counter(winners)
+
+
+# ---------------------------------------------------------------------------
+# 分组配额（participant_groups / group_thresholds）
+# ---------------------------------------------------------------------------
+
+
+async def _create_grouped(client, **overrides):
+    participants = ["a1", "a2", "b1", "b2", "c1"]
+    groups = {p: ("A" if p.startswith("a") else "B" if p.startswith("b") else "C")
+              for p in participants}
+    payload = dict(
+        participants=participants,
+        threshold=4,
+        ttl_s=15,
+        groups=groups,
+        quotas={"A": 2, "B": 1, "C": 1},
+    )
+    payload.update(overrides)
+    r = await client.post(
+        "/barriers",
+        json={
+            "participants": payload["participants"],
+            "threshold": payload["threshold"],
+            "deadline": (
+                datetime.now(timezone.utc) + timedelta(seconds=payload["ttl_s"])
+            ).isoformat(),
+            "participant_groups": payload["groups"],
+            "group_thresholds": payload["quotas"],
+        },
+    )
+    return r
+
+
+def _progress(view):
+    assert view["group_progress"] is not None
+    return {g["group"]: g for g in view["group_progress"]}
+
+
+@pytest.mark.asyncio
+async def test_group_quota_create_validation_422():
+    """未知成员、漏分组、非正配额、配额超过组人数、总配额矛盾均返回 422。"""
+    async with await _client() as c:
+        participants = ["a1", "a2", "b1"]
+        groups = {"a1": "A", "a2": "A", "b1": "B"}
+
+        async def create(groups=groups, quotas=None, participants=participants,
+                         threshold=3):
+            return await c.post(
+                "/barriers",
+                json={
+                    "participants": participants,
+                    "threshold": threshold,
+                    "deadline": "2030-01-01T00:00:00Z",
+                    "participant_groups": groups,
+                    "group_thresholds": quotas,
+                },
+            )
+
+        # 未知成员出现在分组映射里
+        r = await create(groups={**groups, "ghost": "A"}, quotas={"A": 2, "B": 1})
+        assert r.status_code == 422
+        # participant_groups 漏了某参与者
+        r = await create(groups={"a1": "A", "a2": "A"}, quotas={"A": 2, "B": 1})
+        assert r.status_code == 422
+        # 只传其中一个字段
+        r = await c.post(
+            "/barriers",
+            json={
+                "participants": participants,
+                "deadline": "2030-01-01T00:00:00Z",
+                "participant_groups": groups,
+            },
+        )
+        assert r.status_code == 422
+        r = await c.post(
+            "/barriers",
+            json={
+                "participants": participants,
+                "deadline": "2030-01-01T00:00:00Z",
+                "group_thresholds": {"A": 2, "B": 1},
+            },
+        )
+        assert r.status_code == 422
+        # 非正配额
+        r = await create(quotas={"A": 0, "B": 1})
+        assert r.status_code == 422
+        r = await create(quotas={"A": -1, "B": 1})
+        assert r.status_code == 422
+        # 配额超过组人数（A 组只有 2 人）
+        r = await create(quotas={"A": 3, "B": 1})
+        assert r.status_code == 422
+        # 配额引用不存在的分组 / 漏掉已存在的分组
+        r = await create(quotas={"A": 2, "X": 1})
+        assert r.status_code == 422
+        r = await create(quotas={"A": 2})
+        assert r.status_code == 422
+        # 各组配额之和（2+2=4）超过总 threshold（3）—— 总配额矛盾
+        r = await create(quotas={"A": 2, "B": 2}, threshold=3)
+        assert r.status_code == 422
+        # 空分组名
+        r = await create(
+            groups={"a1": " ", "a2": "A", "b1": "B"},
+            quotas={"A": 1, "B": 1, " ": 1},
+        )
+        assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_group_quota_not_reached_until_both_total_and_groups_satisfied():
+    """总人数先达标但组配额未满 -> 继续 waiting；补齐短板组后唯一触发 reached。"""
+    async with await _client() as c:
+        b = await _create_grouped(c)
+        assert b.status_code == 201, b.text
+        body = b.json()
+        bid = body["barrier_id"]
+        assert body["participant_groups"] == {
+            "a1": "A", "a2": "A", "b1": "B", "b2": "B", "c1": "C",
+        }
+        prog = _progress(body)
+        assert set(prog) == {"A", "B", "C"}
+        for name in ("A", "B", "C"):
+            assert prog[name]["checked_count"] == 0
+            assert prog[name]["satisfied"] is False
+
+        # A 组 2 人 + B 组 1 人 + C 组 1 人 = 4，刚好总人数与各组配额同时满足
+        for pid in ("a1", "b1", "c1"):
+            r = await checkin(c, bid, pid)
+            assert r.json()["status"] == "checked_in"
+            assert r.json()["triggered"] is False
+        # 第 4 人报到 b2：总数达标（4/4）但 A 组只有 1/2，仍须 waiting
+        r = await checkin(c, bid, "b2")  # A=1,B=2,C=1，A 组缺 1
+        assert r.status_code == 200
+        v = r.json()["view"]
+        assert v["status"] == "waiting"
+        assert r.json()["triggered"] is False
+        prog = _progress(v)
+        assert (prog["A"]["checked_count"], prog["A"]["satisfied"]) == (1, False)
+        assert (prog["B"]["checked_count"], prog["B"]["satisfied"]) == (2, True)
+        assert (prog["C"]["checked_count"], prog["C"]["satisfied"]) == (1, True)
+        assert v["checked_count"] == 4  # 总数已达标但仍不能触发
+
+        # 补齐 A 组：本次唯一触发达标
+        r = await checkin(c, bid, "a2")
+        body = r.json()
+        assert body["status"] == "reached"
+        assert body["triggered"] is True
+        assert sorted(body["quorum"]) == ["a1", "a2", "b1", "b2", "c1"]
+        v = body["view"]
+        prog = _progress(v)
+        assert all(prog[g]["satisfied"] for g in prog)
+        assert prog["A"]["checked_count"] == 2
+        assert prog["B"]["checked_count"] == 2
+        assert prog["C"]["checked_count"] == 1
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "reached"
+        assert g["quorum"] == body["quorum"]
+        assert all(x["satisfied"] for x in g["group_progress"])
+
+
+@pytest.mark.asyncio
+async def test_group_quota_duplicate_checkins_not_double_counted():
+    """组配额未满时重复报到不重复累计；达标后报到为 late 且冻结进度不变。"""
+    async with await _client() as c:
+        b = (await _create_grouped(c)).json()
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a1")
+        for _ in range(3):
+            r = await checkin(c, bid, "a1")
+            assert r.json()["status"] == "already_checked_in"
+            assert r.json()["triggered"] is False
+        v = (await c.get(f"/barriers/{bid}")).json()
+        assert v["checked_count"] == 1
+        prog = _progress(v)
+        assert prog["A"]["checked_count"] == 1  # 重复报到没有重复累计
+
+        # 达标
+        for pid in ("a2", "b1", "c1"):
+            await checkin(c, bid, pid)
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "reached"
+        frozen_prog = {x["group"]: x["checked_count"] for x in g["group_progress"]}
+
+        # 冻结后的报到（含已报到成员重复与新成员 b2）均不改写计数与快照
+        for pid in ("b2", "a1", "b2"):
+            r = await checkin(c, bid, pid)
+            assert r.json()["status"] == "late"
+            assert r.json()["triggered"] is False
+            rv = r.json()["view"]
+            late_counts = {x["group"]: x["checked_count"] for x in rv["group_progress"]}
+            assert late_counts == frozen_prog
+            assert rv["quorum"] == g["quorum"]
+        g2 = (await c.get(f"/barriers/{bid}")).json()
+        assert g2["quorum"] == g["quorum"]
+        assert g2["frozen_at"] == g["frozen_at"]
+        assert set(g2["late"]) == {"b2"}
+
+
+@pytest.mark.asyncio
+async def test_group_quota_concurrent_cross_group_single_trigger():
+    """跨组并发报到：所有短板在同一波补齐时，仍只有一个请求 triggered=true。"""
+    async with await _client() as c:
+        participants = ["a1", "a2", "b1", "b2", "c1", "c2"]
+        groups = {p: p[0].upper() for p in participants}
+        b = await create_barrier(
+            c,
+            participants,
+            threshold=6,
+            ttl_s=15,
+            groups=groups,
+            quotas={"A": 2, "B": 2, "C": 2},
+        )
+        bid = b["barrier_id"]
+
+        # 先报到 5 人：B 组差 1（b2 未到），总数也差 1
+        first = ["a1", "a2", "b1", "c1", "c2"]
+        for pid in first:
+            await checkin(c, bid, pid)
+        v = (await c.get(f"/barriers/{bid}")).json()
+        assert v["status"] == "waiting"
+
+        # 同一分组的剩余成员 + 一个重复报到并发：只有 b2 能触发
+        reqs = [checkin(c, bid, "b2"), checkin(c, bid, "a1")]
+        results = await asyncio.gather(*reqs)
+        bodies = [r.json() for r in results]
+        triggered = [x for x in bodies if x["triggered"]]
+        assert len(triggered) == 1, bodies
+        assert triggered[0]["status"] == "reached"
+        assert sorted(triggered[0]["quorum"]) == sorted(participants)
+
+        # 更大并发面：全新屏障，所有人同时首报到，只有一个 reached
+        b2 = await create_barrier(
+            c,
+            participants,
+            threshold=6,
+            ttl_s=15,
+            groups=groups,
+            quotas={"A": 2, "B": 2, "C": 2},
+        )
+        bid2 = b2["barrier_id"]
+        results = await asyncio.gather(*(checkin(c, bid2, p) for p in participants))
+        bodies = [r.json() for r in results]
+        assert len([x for x in bodies if x["triggered"]]) == 1
+        assert len([x for x in bodies if x["status"] == "reached"]) == 1
+        assert {x["status"] for x in bodies} <= {"checked_in", "reached"}
+
+
+@pytest.mark.asyncio
+async def test_group_quota_expired_and_cancelled_snapshot_progress():
+    """expired / cancelled 终态也带 group_progress（当时快照计数）。"""
+    async with await _client() as c:
+        participants = ["a1", "a2", "b1", "b2"]
+        groups = {"a1": "A", "a2": "A", "b1": "B", "b2": "B"}
+
+        # 截止：A 组满、B 组缺，配额未全部满足
+        b = await create_barrier(
+            c, participants, threshold=4, ttl_s=1,
+            groups=groups, quotas={"A": 2, "B": 2},
+        )
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a1")
+        await checkin(c, bid, "a2")
+        await asyncio.sleep(1.2)
+        v = (await c.get(f"/barriers/{bid}")).json()
+        assert v["status"] == "expired"
+        prog = _progress(v)
+        assert prog["A"] == {
+            "group": "A", "threshold": 2, "checked_count": 2, "satisfied": True,
+        }
+        assert prog["B"]["checked_count"] == 0 and prog["B"]["satisfied"] is False
+
+        # 取消：部分分组已满足，快照如实呈现
+        b = await create_barrier(
+            c, participants, threshold=4, ttl_s=15,
+            groups=groups, quotas={"A": 2, "B": 1},
+        )
+        bid = b["barrier_id"]
+        await checkin(c, bid, "b1")
+        r = await cancel(c, bid, "停")
+        assert r.status_code == 200
+        prog = _progress(r.json()["view"])
+        assert prog["A"]["checked_count"] == 0 and prog["A"]["satisfied"] is False
+        assert prog["B"]["checked_count"] == 1 and prog["B"]["satisfied"] is True
+
+
+@pytest.mark.asyncio
+async def test_ungrouped_barrier_keeps_legacy_response_shape():
+    """不传新字段时响应中不出现分组信息（group_progress 为 null 序列化省略/为空）。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["x", "y", "z"], threshold=2, ttl_s=15)
+        bid = b["barrier_id"]
+        assert b["group_progress"] is None
+        assert b["participant_groups"] is None
+
+        r = await checkin(c, bid, "x")
+        assert r.json()["view"]["group_progress"] is None
+        r = await checkin(c, bid, "y")
+        assert r.json()["status"] == "reached"
+        assert r.json()["view"]["group_progress"] is None
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["group_progress"] is None and g["participant_groups"] is None
+        rc = await cancel(
+            c,
+            (await create_barrier(c, ["x"], threshold=1, ttl_s=15))["barrier_id"],
+            "n",
+        )
+        assert rc.json()["view"]["group_progress"] is None

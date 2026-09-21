@@ -6,15 +6,35 @@ import time
 from datetime import datetime, timezone
 
 from .barrier_store import BarrierMeta, BarrierStore
-from .models import BarrierView
+from .models import BarrierView, GroupProgress
+
+# 不可再变的终态：达标、截止、主动取消
+SETTLED_STATUSES = frozenset({"reached", "expired", "cancelled"})
 
 
 def _dt(ts: float) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-# 不可再变的终态：达标、截止、主动取消
-SETTLED_STATUSES = frozenset({"reached", "expired", "cancelled"})
+def _group_progress(
+    meta: BarrierMeta, counts: dict[str, int]
+) -> list[GroupProgress] | None:
+    """组装分组配额进度；未启用分组配额时返回 None（保持旧版响应形态）。
+
+    reached 状态传入的 counts 是冻结快照，其余状态是实时计数；
+    satisfied 统一按 counts 与配额比较，终态视图因此不再回读可变数据。
+    """
+    if not meta.groups_enabled:
+        return None
+    return [
+        GroupProgress(
+            group=group,
+            threshold=meta.group_thresholds[group],
+            checked_count=int(counts.get(group, 0)),
+            satisfied=int(counts.get(group, 0)) >= meta.group_thresholds[group],
+        )
+        for group in sorted(meta.group_thresholds)
+    ]
 
 
 async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None = None) -> BarrierView:
@@ -32,6 +52,13 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
     frozen = await store.get_frozen(meta.barrier_id)
     cancelled = await store.get_cancelled(meta.barrier_id)
     checked = await store.checked_members(meta.barrier_id)
+    # reached 使用冻结的分组计数快照；其余状态读实时计数（终态不会再变化）。
+    group_counts = (
+        frozen["group_counts"]
+        if frozen is not None
+        else await store.group_check_counts(meta.barrier_id)
+    )
+    groups = meta.participant_groups if meta.groups_enabled else None
 
     if frozen is not None:
         quorum = frozen["quorum"]
@@ -50,6 +77,8 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             frozen_at=_dt(frozen["frozen_at"]),
             late=late or None,
             creator_id=meta.creator_id,
+            participant_groups=groups,
+            group_progress=_group_progress(meta, group_counts),
         )
 
     if cancelled is not None:
@@ -67,6 +96,8 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             cancel_reason=cancelled["reason"],
             cancelled_at=_dt(cancelled["cancelled_at"]),
             creator_id=meta.creator_id,
+            participant_groups=groups,
+            group_progress=_group_progress(meta, group_counts),
         )
 
     if now >= meta.deadline:
@@ -84,6 +115,8 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             checked_count=len(checked_sorted),
             missing=missing,
             creator_id=meta.creator_id,
+            participant_groups=groups,
+            group_progress=_group_progress(meta, group_counts),
         )
 
     checked_sorted = sorted(checked)
@@ -97,6 +130,8 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
         checked_in=checked_sorted,
         checked_count=len(checked_sorted),
         creator_id=meta.creator_id,
+        participant_groups=groups,
+        group_progress=_group_progress(meta, group_counts),
     )
 
 
