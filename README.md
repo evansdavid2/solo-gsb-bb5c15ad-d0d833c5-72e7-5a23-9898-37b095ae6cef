@@ -3,8 +3,9 @@
 基于 **Python 3.12 + FastAPI + Redis** 的并行任务协调收尾服务：
 
 - 创建屏障时指定**参与者名单**、**达标人数（quorum）**和**截止时间**；
+- 可选**分组配额达标策略**：创建时传入 `participant_groups`（每个参与者恰属一组）与 `group_thresholds`（每组配额），启用后只有**总报到数达到 threshold 且各组报到数均达到对应配额**才进入 `reached`；
 - 参与者以自己的标识**幂等报到**；
-- 并发报到中**首次达到达标人数的瞬间，达标成员在 Redis 内被原子冻结**为快照，之后的任何报到（哪怕来自其他名单成员）都不会改写 `quorum` 与 `frozen_at`；
+- 并发报到中**首次满足达标条件的瞬间，达标成员在 Redis 内被原子冻结**为快照，之后的任何报到（哪怕来自其他名单成员）都不会改写 `quorum` 与 `frozen_at`；
 - 支持**主动取消**：取消与达标报到在 Redis 中**原子竞争**，先发生者成为唯一终态（`cancelled` 与 `reached` 互斥）；取消保存 `reason` / `cancelled_at` 并唤醒全部等待者；
 - 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
 
@@ -68,6 +69,43 @@ curl -s -X POST http://localhost:8000/barriers \
 
 校验：`threshold <= 参与者人数`；`deadline` 必须是未来时间；名单会自动去重、去空白。
 
+#### 可选：分组配额达标策略
+
+同时传入 `participant_groups` 与 `group_thresholds` 即可启用（两个字段必须同时提供，否则 `422`）：
+
+- `participant_groups`：`参与者标识 -> 组名`，**每个参与者必须恰好属于一组**；
+- `group_thresholds`：`组名 -> 该组达标所需报到数`。
+
+启用后，只有**去重后的总报到数达到 `threshold` 且各组报到数均达到对应配额**，屏障才进入 `reached`；查询与报到响应会附带 `group_progress`（各组 `size` / `quota` / `checked` / `met`）。不传这两个字段时行为与之前完全一致（响应中 `group_progress` 为 `null`）。
+
+```bash
+curl -s -X POST http://localhost:8000/barriers \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "participants": ["node-a1","node-a2","node-b1"],
+        "threshold": 3,
+        "participant_groups": {"node-a1":"dc-a","node-a2":"dc-a","node-b1":"dc-b"},
+        "group_thresholds": {"dc-a":1,"dc-b":1},
+        "deadline": "2026-09-20T15:00:00Z"
+      }'
+```
+
+返回（`201`，节选）：
+
+```json
+{
+  "barrier_id": "9d4e…",
+  "status": "waiting",
+  "threshold": 3,
+  "group_progress": {
+    "dc-a": {"size": 2, "quota": 1, "checked": 0, "met": false},
+    "dc-b": {"size": 1, "quota": 1, "checked": 0, "met": false}
+  }
+}
+```
+
+分组校验规则（违反即 `422`）：`participant_groups` 含名单外成员；存在未分组的参与者；配额非正整数；配额超过该组人数；给没有成员的组设配额；各组配额之和大于 `threshold`（总配额矛盾）。
+
 ### 2. 参与者报到 `POST /barriers/{barrier_id}/checkin`
 
 ```bash
@@ -84,6 +122,8 @@ curl -s -X POST http://localhost:8000/barriers/<id>/checkin \
 - `late`：屏障已达标后才报到，仅记入 `late`，**冻结快照不变**。
 
 非名单成员 → `403`；屏障不存在/已回收 → `404`；截止后或取消后报到 → `409`。
+
+启用分组配额策略时，响应顶层与内嵌 `view` 中均带 `group_progress`（各组人数、配额、已报到数、是否达配额）；重复报到与迟到重复报到不会重复累计分组计数。
 
 ### 3. 主动取消 `POST /barriers/{barrier_id}/cancel`
 
@@ -131,7 +171,7 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取
 
 ### 5. 非阻塞查询 `GET /barriers/{barrier_id}`
 
-随时查看当前 `waiting / reached / expired / cancelled` 状态、报到人数、冻结快照、缺席与迟到名单、取消原因与时间。
+随时查看当前 `waiting / reached / expired / cancelled` 状态、报到人数、冻结快照、缺席与迟到名单、取消原因与时间；启用分组配额策略的屏障还会返回 `group_progress` 各组进度（任何状态下都可查询）。
 
 ### 6. 报到审计事件 `GET /barriers/{barrier_id}/events`
 
@@ -161,7 +201,8 @@ curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 
 ## 并发与一致性保证
 
-- 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ SADD → 人数判定 → 写入冻结快照` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、取消原因均唯一确定。
+- 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ SADD → （启用分组时）分组计数 → 达标判定（总数 + 各组配额）→ 写入冻结快照` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、取消原因均唯一确定。
+- 分组配额策略下，去重后的总数（`checked` 集合）与各组计数（`gcount` 哈希）在**同一次原子操作**中更新：只有 `SADD` 真正加入新成员时才给对应组 +1，重复报到与达标后的迟到重复报到都不会重复累计；达标判定要求 `总数 >= threshold 且各组计数均 >= 配额`，两个条件同时满足才冻结唯一 `quorum`，跨组并发报到也只会有一个请求 `triggered=true`。
 - 报到审计事件在同一 Lua 脚本内追加（`RPUSH` 到 `events` 列表，序号 = 列表长度 + 1），与状态变更同生共死：要么一起成功，要么都不发生；脚本串行执行保证 `seq` 从 1 连续递增、无空洞无重复。
 - 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突。
 - 报到响应里的 `PUBLISH reached` 与取消响应里的 `PUBLISH cancelled` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态。

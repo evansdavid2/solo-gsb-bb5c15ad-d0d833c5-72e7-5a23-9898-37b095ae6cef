@@ -56,7 +56,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="任务收尾屏障 API",
     description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止。",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -97,7 +97,12 @@ async def health(request: Request) -> dict[str, str]:
 
 @app.post("/barriers", response_model=BarrierView, status_code=201, tags=["barriers"])
 async def create_barrier(payload: CreateBarrierRequest, request: Request) -> BarrierView:
-    """创建屏障。截止时间过后 BARRIER_TTL_BUFFER_MS 毫秒内数据可查询，之后自动回收。"""
+    """创建屏障。截止时间过后 BARRIER_TTL_BUFFER_MS 毫秒内数据可查询，之后自动回收。
+
+    可选分组配额策略：同时提供 participant_groups（每个参与者恰属一组）与
+    group_thresholds（每组正整数配额）后，只有总报到数达到 threshold 且各组
+    报到数均达到对应配额，屏障才进入 reached。
+    """
     created_at = time.time()
     deadline_ts = payload.deadline_ts()
 
@@ -118,6 +123,8 @@ async def create_barrier(payload: CreateBarrierRequest, request: Request) -> Bar
         created_at=created_at,
         ttl_ms=ttl_ms,
         creator_id=payload.creator_id,
+        participant_groups=payload.participant_groups,
+        group_thresholds=payload.group_thresholds,
     )
     return await build_view(store(request), meta, created_at)
 
@@ -147,7 +154,8 @@ async def checkin(
     """参与者幂等报到。
 
     - 重复报到返回 already_checked_in / late，不改变任何结果；
-    - 并发报到首次达到达标人数时，达标成员在 Redis Lua 脚本内被原子冻结；
+    - 并发报到首次达到达标人数（启用分组配额时还需各组均达配额）时，
+      达标成员在 Redis Lua 脚本内被原子冻结；
     - 冻结之后的报到只会记录为迟到，quorum 与 frozen_at 永不改写；
     - 屏障被取消后报到返回 409，取消终态不受任何影响。
     """
@@ -175,6 +183,7 @@ async def checkin(
         triggered=result.triggered,
         quorum=result.quorum,
         frozen_at=_dt(result.frozen_at) if result.frozen_at is not None else None,
+        group_progress=view.group_progress,
         view=view,
     )
 

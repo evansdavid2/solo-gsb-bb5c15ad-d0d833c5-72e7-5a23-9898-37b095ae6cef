@@ -2,15 +2,22 @@
 
 每个屏障使用如下键（``bid`` 为屏障 id）：
 
-``barrier:{bid}``          hash  元数据（threshold、deadline、ttl_ms 等）
+``barrier:{bid}``          hash  元数据（threshold、deadline、ttl_ms、groups_enabled 等）
 ``barrier:{bid}:roster``   set   创建时声明的参与者名单
 ``barrier:{bid}:checked``  set   所有有效报到（含达标后的迟到报到）
 ``barrier:{bid}:frozen``   hash  达标冻结快照，仅在达标后存在（quorum/frozen_at）
 ``barrier:{bid}:cancel``   hash  主动取消终态，仅在取消后存在（reason/cancelled_at）
 ``barrier:{bid}:events``   list  报到审计事件（JSON，seq 从 1 递增，只追加）
+``barrier:{bid}:groups``   hash  参与者 -> 组名（仅启用分组配额策略时存在）
+``barrier:{bid}:gthresh``  hash  组名 -> 组配额（仅启用分组配额策略时存在）
+``barrier:{bid}:gcount``   hash  组名 -> 已报到人数（去重后，由报到脚本原子维护）
 
 ``frozen`` 与 ``cancel`` 互斥：达标报到与主动取消由各自的 Lua 脚本原子竞争，
 Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路径都不得改写。
+
+启用分组配额策略时，达标条件为：去重后的总报到数 >= threshold
+且每个组的报到数（``gcount``）均达到对应配额（``gthresh``）；两个条件在同一
+Lua 脚本内原子判定，冻结的 quorum 唯一。
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
 在主动取消后发布 ``cancelled`` 消息。
@@ -40,6 +47,11 @@ from redis.asyncio import Redis
 #
 # 四种成功状态（reached/checked_in/already_checked_in/late）都会在同一脚本内
 # 向 events 列表追加一条审计事件（seq 递增）；错误路径不产生任何事件。
+#
+# 分组配额策略（meta 含 groups_enabled 时启用）：报到脚本在同一原子操作内
+# 维护去重后的分组计数 gcount——只有 SADD 真正加入新成员时才给对应组 +1，
+# 重复报到与达标后的迟到重复报到都不会重复累计；达标判定要求
+# 总数 >= threshold 且各组计数均 >= 组配额，满足才冻结唯一 quorum。
 CHECKIN_SCRIPT = """
 local meta_key    = KEYS[1]
 local roster_key  = KEYS[2]
@@ -47,6 +59,9 @@ local checked_key = KEYS[3]
 local frozen_key  = KEYS[4]
 local events_key  = KEYS[5]
 local cancel_key  = KEYS[6]
+local groups_key  = KEYS[7]
+local gthresh_key = KEYS[8]
+local gcount_key  = KEYS[9]
 local pid         = ARGV[1]
 local now         = tonumber(ARGV[2])
 
@@ -59,6 +74,9 @@ local function refresh_ttl()
         redis.call('PEXPIRE', frozen_key, ttl_ms)
         redis.call('PEXPIRE', events_key, ttl_ms)
         redis.call('PEXPIRE', cancel_key, ttl_ms)
+        redis.call('PEXPIRE', groups_key, ttl_ms)
+        redis.call('PEXPIRE', gthresh_key, ttl_ms)
+        redis.call('PEXPIRE', gcount_key, ttl_ms)
     end
 end
 
@@ -73,6 +91,36 @@ local function record_event(result)
     }))
 end
 
+local function groups_enabled()
+    return redis.call('HEXISTS', meta_key, 'groups_enabled') == 1
+end
+
+-- 分组计数：仅在“去重后的新成员”报到时调用（SADD 返回 1），
+-- 重复报到与迟到重复报到都不会进入这里，因此不会重复累计。
+local function account_group()
+    if groups_enabled() then
+        local g = redis.call('HGET', groups_key, pid)
+        if g then
+            redis.call('HINCRBY', gcount_key, g, 1)
+        end
+    end
+end
+
+-- 各组配额是否全部满足（未启用分组策略时恒为真）。
+local function group_quotas_met()
+    if not groups_enabled() then
+        return true
+    end
+    local quotas = redis.call('HGETALL', gthresh_key)
+    for i = 1, #quotas, 2 do
+        local have = tonumber(redis.call('HGET', gcount_key, quotas[i])) or 0
+        if have < tonumber(quotas[i + 1]) then
+            return false
+        end
+    end
+    return true
+end
+
 if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
     return {'unknown', '0', '', '0'}
 end
@@ -85,8 +133,12 @@ end
 -- 达标冻结之后：冻结键已存在，任何后续报到都不得改写快照。
 local quorum = redis.call('HGET', frozen_key, 'quorum')
 if quorum then
-    -- 仅记录迟到事实，quorum/frozen_at 保持不变。
-    redis.call('SADD', checked_key, pid)
+    -- 仅记录迟到事实，quorum/frozen_at 保持不变；
+    -- 首次迟到的成员仍计入分组进度，重复迟到不重复累计。
+    local newly = redis.call('SADD', checked_key, pid)
+    if newly == 1 then
+        account_group()
+    end
     record_event('late')
     refresh_ttl()
     return {'late', '0', quorum, redis.call('HGET', frozen_key, 'frozen_at')}
@@ -104,11 +156,15 @@ if now >= deadline then
 end
 
 local newly_added = redis.call('SADD', checked_key, pid)
+if newly_added == 1 then
+    account_group()
+end
 local count = redis.call('SCARD', checked_key)
 local threshold = tonumber(redis.call('HGET', meta_key, 'threshold'))
 
--- 首次达到达标人数：在同一脚本内冻结成员名单，杜绝并发覆盖。
-if count >= threshold then
+-- 总数与分组配额在同一脚本内原子判定：首次同时满足时冻结成员名单，
+-- 杜绝并发覆盖；跨组并发报到也只会有一个请求走到这里。
+if count >= threshold and group_quotas_met() then
     local members = redis.call('SMEMBERS', checked_key)
     table.sort(members)
     local payload = cjson.encode(members)
@@ -206,6 +262,9 @@ class BarrierMeta:
     created_at: float  # Unix 秒
     ttl_ms: int
     creator_id: str | None
+    # 分组配额策略（未启用时为 None）：参与者 -> 组名、组名 -> 配额
+    participant_groups: dict[str, str] | None = None
+    group_thresholds: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -247,7 +306,7 @@ class BarrierStore:
     def channel(barrier_id: str) -> str:
         return f"barrier:{barrier_id}:events"
 
-    def _keys(self, barrier_id: str) -> tuple[str, str, str, str, str, str]:
+    def _keys(self, barrier_id: str) -> tuple[str, ...]:
         return (
             f"barrier:{barrier_id}",
             f"barrier:{barrier_id}:roster",
@@ -255,6 +314,9 @@ class BarrierStore:
             f"barrier:{barrier_id}:frozen",
             f"barrier:{barrier_id}:events",
             f"barrier:{barrier_id}:cancel",
+            f"barrier:{barrier_id}:groups",
+            f"barrier:{barrier_id}:gthresh",
+            f"barrier:{barrier_id}:gcount",
         )
 
     async def create(
@@ -265,9 +327,13 @@ class BarrierStore:
         created_at: float,
         ttl_ms: int,
         creator_id: str | None = None,
+        participant_groups: dict[str, str] | None = None,
+        group_thresholds: dict[str, int] | None = None,
     ) -> BarrierMeta:
         barrier_id = uuid.uuid4().hex
-        meta_key, roster_key, _, _, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _, _, groups_key, gthresh_key, _ = self._keys(
+            barrier_id
+        )
         mapping: dict[str, Any] = {
             "threshold": threshold,
             "deadline": f"{deadline_ts:.3f}",
@@ -277,11 +343,23 @@ class BarrierStore:
         if creator_id:
             mapping["creator_id"] = creator_id
 
+        groups_enabled = participant_groups is not None and group_thresholds is not None
+        if groups_enabled:
+            mapping["groups_enabled"] = "1"
+
         async with self.redis.pipeline(transaction=True) as pipe:
             pipe.hset(meta_key, mapping=mapping)
             pipe.sadd(roster_key, *participants)
             pipe.pexpire(meta_key, ttl_ms)
             pipe.pexpire(roster_key, ttl_ms)
+            if groups_enabled:
+                pipe.hset(groups_key, mapping=participant_groups)
+                pipe.hset(
+                    gthresh_key,
+                    mapping={g: str(q) for g, q in group_thresholds.items()},
+                )
+                pipe.pexpire(groups_key, ttl_ms)
+                pipe.pexpire(gthresh_key, ttl_ms)
             await pipe.execute()
 
         return BarrierMeta(
@@ -292,14 +370,26 @@ class BarrierStore:
             created_at=created_at,
             ttl_ms=ttl_ms,
             creator_id=creator_id,
+            participant_groups=participant_groups if groups_enabled else None,
+            group_thresholds=(
+                dict(group_thresholds) if groups_enabled else None
+            ),
         )
 
     async def get_meta(self, barrier_id: str) -> BarrierMeta | None:
-        meta_key, roster_key, _, _, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _, _, groups_key, gthresh_key, _ = self._keys(
+            barrier_id
+        )
         data = await self.redis.hgetall(meta_key)
         if not data:
             return None
         participants = sorted(await self.redis.smembers(roster_key))
+        participant_groups: dict[str, str] | None = None
+        group_thresholds: dict[str, int] | None = None
+        if data.get("groups_enabled") == "1":
+            participant_groups = await self.redis.hgetall(groups_key)
+            raw_thresholds = await self.redis.hgetall(gthresh_key)
+            group_thresholds = {g: int(q) for g, q in raw_thresholds.items()}
         return BarrierMeta(
             barrier_id=barrier_id,
             participants=participants,
@@ -308,6 +398,8 @@ class BarrierStore:
             created_at=float(data["created_at"]),
             ttl_ms=int(data["ttl_ms"]),
             creator_id=data.get("creator_id"),
+            participant_groups=participant_groups,
+            group_thresholds=group_thresholds,
         )
 
     async def checkin(self, barrier_id: str, participant_id: str) -> CheckinResult:
@@ -372,7 +464,7 @@ class BarrierStore:
         return result
 
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:
-        _, _, _, frozen_key, _, _ = self._keys(barrier_id)
+        frozen_key = self._keys(barrier_id)[3]
         data = await self.redis.hgetall(frozen_key)
         if not data:
             return None
@@ -382,7 +474,7 @@ class BarrierStore:
         }
 
     async def get_cancelled(self, barrier_id: str) -> dict[str, Any] | None:
-        *_, cancel_key = self._keys(barrier_id)
+        cancel_key = self._keys(barrier_id)[5]
         data = await self.redis.hgetall(cancel_key)
         if not data:
             return None
@@ -392,8 +484,14 @@ class BarrierStore:
         }
 
     async def checked_members(self, barrier_id: str) -> set[str]:
-        _, _, checked_key, _, _, _ = self._keys(barrier_id)
+        checked_key = self._keys(barrier_id)[2]
         return await self.redis.smembers(checked_key)
+
+    async def group_counts(self, barrier_id: str) -> dict[str, int]:
+        """各组已报到人数（去重后，由报到脚本原子维护；未报到过的组无条目）。"""
+        gcount_key = self._keys(barrier_id)[8]
+        raw = await self.redis.hgetall(gcount_key)
+        return {g: int(c) for g, c in raw.items()}
 
     async def list_events(
         self, barrier_id: str, cursor: int, limit: int
@@ -403,7 +501,7 @@ class BarrierStore:
         事件只追加且 seq 与列表下标一一对应（下标 = seq - 1），并发报到
         只会让游标右侧变长，已读区间稳定，因此游标分页不重不漏。
         """
-        _, _, _, _, events_key, _ = self._keys(barrier_id)
+        events_key = self._keys(barrier_id)[4]
         raw = await self.redis.lrange(events_key, cursor, cursor + limit - 1)
         events = [json.loads(item) for item in raw]
         next_cursor = events[-1]["seq"] if events else cursor
